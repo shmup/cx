@@ -103,6 +103,14 @@ def make_keybindings():
     return kb
 
 
+def get_winsize():
+    """get terminal window size"""
+    s = struct.pack("HHHH", 0, 0, 0, 0)
+    result = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, s)
+    rows, cols, _, _ = struct.unpack("HHHH", result)
+    return rows, cols
+
+
 def parse_args():
     args = sys.argv[1:]
     delegate = False
@@ -272,9 +280,7 @@ def main():
 
     # update pty to current terminal size
     try:
-        s = struct.pack("HHHH", 0, 0, 0, 0)
-        result = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, s)
-        rows, cols, _, _ = struct.unpack("HHHH", result)
+        rows, cols = get_winsize()
         child.setwinsize(rows, cols)
     except OSError:
         pass
@@ -282,9 +288,7 @@ def main():
     # handle window resizes
     def sigwinch(_sig, _frame):
         try:
-            s = struct.pack("HHHH", 0, 0, 0, 0)
-            result = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, s)
-            rows, cols, _, _ = struct.unpack("HHHH", result)
+            rows, cols = get_winsize()
             child.setwinsize(rows, cols)
         except OSError:
             pass
