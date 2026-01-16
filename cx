@@ -11,6 +11,7 @@
 
 import fcntl
 import os
+import shutil
 import signal
 import struct
 import subprocess
@@ -165,6 +166,11 @@ def parse_args():
 
 def main():
     delegate, yolo, resume, claude_args = parse_args()
+
+    # check claude is installed
+    if not shutil.which("claude"):
+        print("claude not found in PATH", file=sys.stderr)
+        sys.exit(1)
 
     # build command args
     args = []
