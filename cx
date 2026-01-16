@@ -7,7 +7,7 @@
 #
 # type @ followed by characters to fuzzy-search files in cwd
 # ctrl-d to submit, ctrl-c to cancel, ctrl-g to edit in vim, ctrl-z to suspend
-# supports flags: -d (delegate), -y (yolo), -r (resume), -h (help)
+# skills configured via ~/.config/cx/config.toml
 
 import fcntl
 import os
@@ -18,6 +18,7 @@ import subprocess
 import sys
 import termios
 import threading
+import tomllib
 from pathlib import Path
 from queue import Queue, Empty
 
@@ -88,6 +89,59 @@ class AtFileCompleter(Completer):
         return all(c in it for c in query)
 
 
+def load_config():
+    """load skills from ~/.config/cx/config.toml"""
+    config_path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "cx" / "config.toml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        with open(config_path, "rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        print(f"warning: invalid config {config_path}: {e}", file=sys.stderr)
+        return {}
+
+
+def get_skills(config):
+    """extract skills from config, warn on conflicts with built-ins"""
+    builtin_flags = {"h", "y", "r"}
+    builtin_longs = {"help", "yolo", "resume"}
+    skills = {}
+
+    for name, skill in config.get("skills", {}).items():
+        flag = skill.get("flag", "")
+        long = skill.get("long", name)
+
+        # check for conflicts
+        if flag in builtin_flags:
+            print(f"warning: skill '{name}' flag -{flag} conflicts with built-in, skipping", file=sys.stderr)
+            continue
+        if long in builtin_longs:
+            print(f"warning: skill '{name}' --{long} conflicts with built-in, skipping", file=sys.stderr)
+            continue
+
+        # check for conflicts with other skills
+        for existing_name, existing in skills.items():
+            if flag and flag == existing.get("flag"):
+                print(
+                    f"warning: skill '{name}' flag -{flag} conflicts with '{existing_name}', skipping", file=sys.stderr
+                )
+                flag = ""
+            if long == existing.get("long"):
+                print(f"warning: skill '{name}' --{long} conflicts with '{existing_name}', skipping", file=sys.stderr)
+                continue
+
+        skills[name] = {
+            "flag": flag,
+            "long": long,
+            "desc": skill.get("desc", name),
+            "path": Path(skill.get("path", "")).expanduser(),
+        }
+
+    return skills
+
+
 def make_keybindings():
     """ctrl-g opens editor, ctrl-d submits, ctrl-z suspends"""
     kb = KeyBindings()
@@ -115,34 +169,46 @@ def get_winsize():
     return rows, cols
 
 
-def parse_args():
+def parse_args(skills):
+    """parse args with dynamic skill flags"""
     args = sys.argv[1:]
-    delegate = False
     yolo = False
     resume = False
+    active_skills = []
     claude_args = []
+
+    # build lookup tables for skills
+    flag_to_skill = {s["flag"]: name for name, s in skills.items() if s["flag"]}
+    long_to_skill = {s["long"]: name for name, s in skills.items()}
+
+    def print_help():
+        print("usage: cx [options] [-- claude flags]")
+        print("")
+        print("options:")
+        # dynamic skill options
+        for name, s in skills.items():
+            if s["flag"]:
+                print(f"  -{s['flag']}, --{s['long']:10} {s['desc']}")
+            else:
+                print(f"      --{s['long']:10} {s['desc']}")
+        # built-in options
+        print("  -y, --yolo       skip all permission prompts")
+        print("  -r, --resume     resume last conversation")
+        print("  -h, --help       show this help")
+        print("")
+        print("in prompt:")
+        print("  @filename        fuzzy-search files")
+        print("  ctrl-g           edit in vim")
+        print("  ctrl-d           submit")
+        print("  ctrl-c           cancel")
+        print("  ctrl-z           suspend (fg to resume)")
+        sys.exit(0)
 
     i = 0
     while i < len(args):
         arg = args[i]
         if arg in ("-h", "--help"):
-            print("usage: cx [options] [-- claude flags]")
-            print("")
-            print("options:")
-            print("  -d, --delegate   delegate mode (reader/maker subagents)")
-            print("  -y, --yolo       skip all permission prompts")
-            print("  -r, --resume     resume last conversation")
-            print("  -h, --help       show this help")
-            print("")
-            print("in prompt:")
-            print("  @filename        fuzzy-search files")
-            print("  ctrl-g           edit in vim")
-            print("  ctrl-d           submit")
-            print("  ctrl-c           cancel")
-            print("  ctrl-z           suspend (fg to resume)")
-            sys.exit(0)
-        elif arg in ("-d", "--delegate"):
-            delegate = True
+            print_help()
         elif arg in ("-y", "--yolo"):
             yolo = True
         elif arg in ("-r", "--resume"):
@@ -150,27 +216,36 @@ def parse_args():
         elif arg == "--":
             claude_args.extend(args[i + 1 :])
             break
-        elif arg.startswith("-") and not arg.startswith("--"):
+        elif arg.startswith("--"):
+            long = arg[2:]
+            if long in long_to_skill:
+                active_skills.append(long_to_skill[long])
+            else:
+                claude_args.append(arg)
+        elif arg.startswith("-"):
             # combined flags like -dy
             for c in arg[1:]:
-                if c == "d":
-                    delegate = True
-                elif c == "y":
+                if c == "y":
                     yolo = True
                 elif c == "r":
                     resume = True
                 elif c == "h":
-                    print("usage: cx [-d] [-y] [-r] [-h]")
-                    sys.exit(0)
+                    print_help()
+                elif c in flag_to_skill:
+                    active_skills.append(flag_to_skill[c])
+                else:
+                    claude_args.append(f"-{c}")
         else:
             claude_args.append(arg)
         i += 1
 
-    return delegate, yolo, resume, claude_args
+    return yolo, resume, active_skills, claude_args
 
 
 def main():
-    delegate, yolo, resume, claude_args = parse_args()
+    config = load_config()
+    skills = get_skills(config)
+    yolo, resume, active_skills, claude_args = parse_args(skills)
 
     # check claude is installed
     if not shutil.which("claude"):
@@ -180,12 +255,13 @@ def main():
     # build command args
     args = []
 
-    if delegate:
-        skill_path = Path.home() / ".claude/skills/delegate/SKILL.md"
-        if not skill_path.exists():
-            print("need a delegate skill", file=sys.stderr)
+    # load active skills
+    for skill_name in active_skills:
+        skill = skills[skill_name]
+        if not skill["path"].exists():
+            print(f"skill '{skill_name}' not found: {skill['path']}", file=sys.stderr)
             sys.exit(1)
-        args.extend(["--append-system-prompt", skill_path.read_text()])
+        args.extend(["--append-system-prompt", skill["path"].read_text()])
 
     if yolo:
         args.append("--dangerously-skip-permissions")

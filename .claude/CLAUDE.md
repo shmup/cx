@@ -5,12 +5,10 @@ key features:
 - starts claude immediately via pexpect while user types prompt
 - fuzzy @file completion using git ls-files
 - ctrl-g opens vim for multiline editing
-- ctrl-d submits (explicit binding for multiline mode)
+- ctrl-d submits, ctrl-z suspends
+- configurable skills via ~/.config/cx/config.toml
 - bottom toolbar shows startup status
-- waits for claude to be ready before sending prompt
 - proper terminal state management around prompt_toolkit
-- SIGWINCH handling for window resizes
-- bracketed paste for multiline prompts
 
 architecture:
 
@@ -18,7 +16,15 @@ architecture:
 - background thread monitors output for "Model:" to detect ready state
 - prompt_toolkit handles input with refresh_interval for toolbar updates
 - terminal state saved/restored around prompt_toolkit
-- buffered startup output displayed before handover
+- skills loaded from toml, injected as --append-system-prompt
+
+config format:
+
+    [skills.name]
+    flag = "x"           # short flag (optional)
+    long = "name"        # defaults to skill name
+    desc = "description"
+    path = "~/path/to/SKILL.md"
 
 when modifying:
 
@@ -26,4 +32,5 @@ when modifying:
 - test ctrl-d submission in multiline mode
 - test window resize during interaction
 - test cancel with ctrl-c (should terminate child cleanly)
-- test submitting before claude is ready (should wait)
+- test ctrl-z suspend and fg resume
+- test skill flag conflicts (should warn, built-ins win)
