@@ -79,7 +79,6 @@ class AtFileCompleter(Completer):
                 yield Completion(
                     filepath,
                     start_position=-(len(query) + 1),  # +1 for @
-                    display_meta="",
                 )
 
     def _fuzzy_match(self, query: str, text: str) -> bool:
