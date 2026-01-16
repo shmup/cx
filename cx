@@ -6,7 +6,7 @@
 # cx - claude launcher with fuzzy @ file completion
 #
 # type @ followed by characters to fuzzy-search files in cwd
-# ctrl-d to submit, ctrl-c to cancel, ctrl-g to edit in vim
+# ctrl-d to submit, ctrl-c to cancel, ctrl-g to edit in vim, ctrl-z to suspend
 # supports flags: -d (delegate), -y (yolo), -r (resume), -h (help)
 
 import fcntl
@@ -89,7 +89,7 @@ class AtFileCompleter(Completer):
 
 
 def make_keybindings():
-    """ctrl-g opens editor, ctrl-d submits"""
+    """ctrl-g opens editor, ctrl-d submits, ctrl-z suspends"""
     kb = KeyBindings()
 
     @kb.add("c-g")
@@ -99,6 +99,10 @@ def make_keybindings():
     @kb.add("c-d")
     def submit(event):
         event.app.current_buffer.validate_and_handle()
+
+    @kb.add("c-z")
+    def suspend(event):
+        event.app.suspend_to_background()
 
     return kb
 
@@ -135,6 +139,7 @@ def parse_args():
             print("  ctrl-g           edit in vim")
             print("  ctrl-d           submit")
             print("  ctrl-c           cancel")
+            print("  ctrl-z           suspend (fg to resume)")
             sys.exit(0)
         elif arg in ("-d", "--delegate"):
             delegate = True
@@ -235,8 +240,9 @@ def main():
 
     # save terminal state before prompt_toolkit
     old_tty = termios.tcgetattr(sys.stdin)
+    termios.tcflush(sys.stdin, termios.TCIFLUSH)  # discard pending input
 
-    print("\033[2menter prompt (@ files, ctrl-g vim, ctrl-d submit)\033[0m")
+    print("\033[2menter prompt (@ files, ctrl-g vim, ctrl-d submit, ctrl-z suspend)\033[0m")
     try:
         text = prompt(
             "> ",
@@ -300,11 +306,40 @@ def main():
 
     signal.signal(signal.SIGWINCH, sigwinch)
 
+    # handle suspend (ctrl-z)
+    def sigtstp(_sig, _frame):
+        # pause child, restore terminal, suspend ourselves
+        child.kill(signal.SIGSTOP)
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+        signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTSTP)
+
+    def sigcont(_sig, _frame):
+        # re-register handlers after resume
+        signal.signal(signal.SIGTSTP, sigtstp)
+        signal.signal(signal.SIGCONT, sigcont)
+        # resume child and sync terminal size
+        child.kill(signal.SIGCONT)
+        try:
+            rows, cols = get_winsize()
+            child.setwinsize(rows, cols)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTSTP, sigtstp)
+    signal.signal(signal.SIGCONT, sigcont)
+
     # send prompt using bracketed paste (preserves multiline without early submit)
     child.send("\x1b[200~" + text + "\x1b[201~\r")
 
-    # hand over terminal to user
-    child.interact()
+    # hand over terminal to user - ctrl-z (0x1a) triggers suspend
+    def handle_input(data):
+        if b"\x1a" in data:
+            os.kill(os.getpid(), signal.SIGTSTP)
+            return data.replace(b"\x1a", b"")
+        return data
+
+    child.interact(input_filter=handle_input)
 
 
 if __name__ == "__main__":
