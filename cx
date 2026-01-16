@@ -1,0 +1,295 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = ["prompt_toolkit", "pexpect"]
+# ///
+#
+# cx - claude launcher with fuzzy @ file completion
+#
+# type @ followed by characters to fuzzy-search files in cwd
+# ctrl-d to submit, ctrl-c to cancel, ctrl-g to edit in vim
+# supports flags: -d (delegate), -y (yolo), -r (resume), -h (help)
+
+import fcntl
+import os
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import threading
+from pathlib import Path
+
+import pexpect
+from prompt_toolkit import prompt
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.key_binding import KeyBindings
+
+
+class AtFileCompleter(Completer):
+    """fuzzy file completer triggered by @"""
+
+    def __init__(self):
+        self.files = []
+        self._scan_files()
+
+    def _scan_files(self):
+        """scan cwd for files (respects .gitignore via git ls-files if available)"""
+        try:
+            result = subprocess.run(
+                ["git", "ls-files"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                self.files = [f for f in result.stdout.strip().split("\n") if f]
+                return
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+        # fallback: walk directory (skip hidden, node_modules, etc)
+        skip = {".git", "node_modules", "__pycache__", ".venv", "venv", "target"}
+        files = []
+        for root, dirs, filenames in os.walk("."):
+            dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")]
+            for f in filenames:
+                if not f.startswith("."):
+                    path = os.path.join(root, f)[2:]  # strip ./
+                    files.append(path)
+        self.files = files[:1000]  # cap for performance
+
+    def get_completions(self, document: Document, complete_event):
+        text = document.text_before_cursor
+
+        # find last @ and get query after it
+        at_pos = text.rfind("@")
+        if at_pos == -1:
+            return
+
+        query = text[at_pos + 1 :].lower()
+        if not query:  # need at least one char after @
+            return
+
+        # fuzzy match: all query chars must appear in order
+        for filepath in self.files:
+            if self._fuzzy_match(query, filepath.lower()):
+                yield Completion(
+                    filepath,
+                    start_position=-(len(query) + 1),  # +1 for @
+                    display_meta="",
+                )
+
+    def _fuzzy_match(self, query: str, text: str) -> bool:
+        """check if all query chars appear in text in order"""
+        it = iter(text)
+        return all(c in it for c in query)
+
+
+def make_keybindings():
+    """ctrl-g opens editor, ctrl-d submits"""
+    kb = KeyBindings()
+
+    @kb.add("c-g")
+    def open_editor(event):
+        event.app.current_buffer.open_in_editor()
+
+    @kb.add("c-d")
+    def submit(event):
+        event.app.current_buffer.validate_and_handle()
+
+    return kb
+
+
+def parse_args():
+    args = sys.argv[1:]
+    delegate = False
+    yolo = False
+    resume = False
+    claude_args = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print("usage: cx [options] [-- claude flags]")
+            print("")
+            print("options:")
+            print("  -d, --delegate   delegate mode (reader/maker subagents)")
+            print("  -y, --yolo       skip all permission prompts")
+            print("  -r, --resume     resume last conversation")
+            print("  -h, --help       show this help")
+            print("")
+            print("in prompt:")
+            print("  @filename        fuzzy-search files")
+            print("  ctrl-g           edit in vim")
+            print("  ctrl-d           submit")
+            print("  ctrl-c           cancel")
+            sys.exit(0)
+        elif arg in ("-d", "--delegate"):
+            delegate = True
+        elif arg in ("-y", "--yolo"):
+            yolo = True
+        elif arg in ("-r", "--resume"):
+            resume = True
+        elif arg == "--":
+            claude_args.extend(args[i + 1 :])
+            break
+        elif arg.startswith("-") and not arg.startswith("--"):
+            # combined flags like -dy
+            for c in arg[1:]:
+                if c == "d":
+                    delegate = True
+                elif c == "y":
+                    yolo = True
+                elif c == "r":
+                    resume = True
+                elif c == "h":
+                    print("usage: cx [-d] [-y] [-r] [-h]")
+                    sys.exit(0)
+        else:
+            claude_args.append(arg)
+        i += 1
+
+    return delegate, yolo, resume, claude_args
+
+
+def main():
+    delegate, yolo, resume, claude_args = parse_args()
+
+    # build command args
+    args = []
+
+    if delegate:
+        skill_path = Path.home() / ".claude/skills/delegate/SKILL.md"
+        if not skill_path.exists():
+            print("need a delegate skill", file=sys.stderr)
+            sys.exit(1)
+        args.extend(["--append-system-prompt", skill_path.read_text()])
+
+    if yolo:
+        args.append("--dangerously-skip-permissions")
+
+    if resume:
+        os.execvp("claude", ["claude", "-c"] + args + claude_args)
+
+    # get terminal size for pty
+    try:
+        rows, cols = os.get_terminal_size()
+    except OSError:
+        rows, cols = 24, 80
+
+    # start claude NOW (primed) while user types their prompt
+    child = pexpect.spawn(
+        "claude",
+        args + claude_args,
+        encoding="utf-8",
+        dimensions=(rows, cols),
+        env=os.environ,
+    )
+
+    # monitor claude startup in background
+    claude_ready = [False]
+    claude_output = []
+
+    def monitor_startup():
+        while not claude_ready[0]:
+            try:
+                data = child.read_nonblocking(1024, timeout=0.1)
+                claude_output.append(data)
+                # status bar with "Model:" means claude is ready for input
+                if "Model:" in data or "❯" in data:
+                    claude_ready[0] = True
+            except pexpect.TIMEOUT:
+                pass
+            except pexpect.EOF:
+                break
+
+    monitor_thread = threading.Thread(target=monitor_startup, daemon=True)
+    monitor_thread.start()
+
+    def get_toolbar():
+        if claude_ready[0]:
+            return HTML('<b fg="ansigreen">✓ claude ready</b>')
+        return HTML('<b fg="ansiyellow">⏳ claude starting...</b>')
+
+    # get prompt with fuzzy completion and keybindings
+    completer = AtFileCompleter()
+    kb = make_keybindings()
+    os.environ.setdefault("EDITOR", "vim")
+
+    # save terminal state before prompt_toolkit
+    old_tty = termios.tcgetattr(sys.stdin)
+
+    print("\033[2menter prompt (@ files, ctrl-g vim, ctrl-d submit)\033[0m")
+    try:
+        text = prompt(
+            "> ",
+            completer=completer,
+            multiline=True,
+            key_bindings=kb,
+            enable_open_in_editor=True,
+            bottom_toolbar=get_toolbar,
+            refresh_interval=0.3,
+        )
+    except (KeyboardInterrupt, EOFError):
+        print("\033[2m(cancelled)\033[0m")
+        child.terminate(force=True)
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+        sys.exit(1)
+
+    # restore terminal state
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+
+    if not text.strip():
+        print("\033[2m(cancelled)\033[0m")
+        child.terminate(force=True)
+        sys.exit(1)
+
+    # wait for claude to be ready if it isn't yet
+    if not claude_ready[0]:
+        print("\033[2mwaiting for claude...\033[0m", end="", flush=True)
+        while not claude_ready[0]:
+            monitor_thread.join(timeout=0.1)
+            if not monitor_thread.is_alive():
+                break
+        print("\r\033[K", end="", flush=True)  # clear the waiting message
+
+    # stop monitoring and show buffered startup output
+    claude_ready[0] = True
+    monitor_thread.join(timeout=0.1)
+    if claude_output:
+        sys.stdout.write("".join(claude_output))
+        sys.stdout.flush()
+
+    # update pty to current terminal size
+    try:
+        s = struct.pack("HHHH", 0, 0, 0, 0)
+        result = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, s)
+        rows, cols, _, _ = struct.unpack("HHHH", result)
+        child.setwinsize(rows, cols)
+    except OSError:
+        pass
+
+    # handle window resizes
+    def sigwinch(_sig, _frame):
+        try:
+            s = struct.pack("HHHH", 0, 0, 0, 0)
+            result = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, s)
+            rows, cols, _, _ = struct.unpack("HHHH", result)
+            child.setwinsize(rows, cols)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGWINCH, sigwinch)
+
+    # send prompt using bracketed paste (preserves multiline without early submit)
+    child.send("\x1b[200~" + text + "\x1b[201~\r")
+
+    # hand over terminal to user
+    child.interact()
+
+
+if __name__ == "__main__":
+    main()
